@@ -1,3 +1,8 @@
+/*
+gogrep implements a simple parallel grep like application.
+
+Inspired by ack and the silver searcher.
+*/
 package main
 
 import (
@@ -15,6 +20,7 @@ var query_str = flag.String("query", "", "help message for flagname")
 var target_dir = flag.String("dir", "", "help message for flagname")
 var query regexp.Regexp
 
+// searchInFile does the actual search for the regex inside the file
 func searchInFile(filename string) chan string {
 	res := make(chan string)
 	go func() {
@@ -39,6 +45,8 @@ func searchInFile(filename string) chan string {
 	return res
 }
 
+// searchInDir walks a directory and generated files to search. For every
+// discovered subdirectory, it launches a new go routine (recursively).
 func searchInDir(dir string, files chan string, first bool) chan os.FileInfo {
 	res := make(chan os.FileInfo)
 	go func() {
@@ -63,6 +71,7 @@ func searchInDir(dir string, files chan string, first bool) chan os.FileInfo {
 
 func main() {
 	flag.Parse()
+
 	query = *regexp.MustCompile(*query_str)
 	files := make(chan string)
 	searchInDir(*target_dir, files, true)
