@@ -7,83 +7,169 @@ package main
 
 import (
 	"bufio"
-	"flag"
+	"container/list"
 	"fmt"
+	"github.com/docopt/docopt.go"
+	"github.com/mgutz/ansi"
 	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
 	"path"
 	"regexp"
+	"runtime/pprof"
 	"strconv"
+	"sync"
+	"time"
 )
 
-var query_str = flag.String("query", "", "help message for flagname")
-var target_dir = flag.String("dir", "", "help message for flagname")
+type HitPrinter func(int, int, string)
+
+type Hit struct {
+	Line, Col int
+	Text      string
+}
+
 var query regexp.Regexp
+var printLock sync.Mutex
+
+var ignore_types = map[string]bool{
+	"application/octet-stream": true,
+}
+
+var ignore_files = map[string]bool{
+	".svn":              true,
+	".agignore":         true,
+	".gitignore":        true,
+	".git":              true,
+	".git/info/exclude": true,
+	".hgignore":         true,
+}
+
+func noColorPrinter(line int, col int, text string) {
+	fmt.Printf("%d: %s\n", line, text)
+}
+
+var redColor = ansi.ColorCode("red+b")
+var yellowColor = ansi.ColorCode("yellow")
+var resetColor = ansi.ColorCode("reset")
+
+func colorPrinter(line int, col int, text string) {
+	msg := redColor + strconv.Itoa(line) + ": " + resetColor + yellowColor + text + resetColor
+	fmt.Println(msg)
+}
 
 // searchInFile does the actual search for the regex inside the file
-func searchInFile(filename string) chan string {
-	res := make(chan string)
-	go func() {
-		defer close(res)
-		file, err := os.Open(filename)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Failed opening file:", err)
-			return
-		}
+func searchInFile(filename string, printer HitPrinter) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatal(os.Stderr, "Failed opening file:", err)
+		return
+	}
 
-		scanner := bufio.NewScanner(file)
-		for i := 1; scanner.Scan(); i++ {
-			if query.Match(scanner.Bytes()) {
-				res <- strconv.Itoa(i) + ": " + scanner.Text()
-			}
-		}
+	file_header := make([]byte, 512)
+	file.Read(file_header)
 
-		if err := scanner.Err(); err != nil {
-			fmt.Fprintln(os.Stderr, "reading standard input:", err)
+	if ignore_types[http.DetectContentType(file_header)] {
+		return
+	}
+	hits := list.New()
+	scanner := bufio.NewScanner(file)
+	for i := 1; scanner.Scan(); i++ {
+		if query.Match(scanner.Bytes()) {
+			hits.PushBack(Hit{i, 0, scanner.Text()})
 		}
-	}()
-	return res
+	}
+	if hits.Len() > 0 {
+		// We serielize the printing of the results for grouping per file
+		//
+		printLock.Lock()
+		fmt.Println(filename)
+		for e := hits.Front(); e != nil; e = e.Next() {
+			printer(e.Value.(Hit).Line, 0, e.Value.(Hit).Text)
+		}
+		fmt.Println("")
+		printLock.Unlock()
+	}
 }
 
 // searchInDir walks a directory and generated files to search. For every
 // discovered subdirectory, it launches a new go routine (recursively).
-func searchInDir(dir string, files chan string, first bool) chan os.FileInfo {
-	res := make(chan os.FileInfo)
-	go func() {
-		defer close(res)
-		if first {
-			defer close(files)
+func searchInDir(dir string, files chan string) {
+	p, _ := ioutil.ReadDir(dir)
+	for i := 0; i < len(p); i++ {
+		if ignore_files[p[i].Name()] {
+			continue
 		}
-		p, _ := ioutil.ReadDir(dir)
-		for i := 0; i < len(p); i++ {
-			if p[i].IsDir() {
-				subres := searchInDir(path.Join(dir, p[i].Name()), files, false)
-				for j := range subres {
-					files <- path.Join(dir, j.Name())
-				}
+
+		if p[i].IsDir() {
+			searchInDir(path.Join(dir, p[i].Name()), files)
+		} else {
+			files <- path.Join(dir, p[i].Name())
+		}
+	}
+}
+
+func initializeIgnoreList() {
+}
+
+func searchFiles(files chan string) {
+	for i := range files {
+		go searchInFile(i, colorPrinter)
+	}
+
+}
+
+func searchPaths(paths []string, files chan string) {
+	defer close(files)
+	if len(paths) == 0 {
+		pwd, _ := os.Getwd()
+		searchInDir(pwd, files)
+	} else {
+		for _, path := range paths {
+			fi, _ := os.Stat(path)
+			if fi.IsDir() {
+				searchInDir(path, files)
 			} else {
-				files <- path.Join(dir, p[i].Name())
+				files <- path
 			}
 		}
-	}()
-	return res
+	}
 }
 
 func main() {
-	flag.Parse()
+	start := time.Now()
+	usage := `Recursively search for PATTERN in PATH
 
-	query = *regexp.MustCompile(*query_str)
-	files := make(chan string)
-	searchInDir(*target_dir, files, true)
-	for i := range files {
-		res := searchInFile(i)
-		found_something := false
-		for result := range res {
-			if !found_something {
-				fmt.Println(i + ":")
-				found_something = true
-			}
-			fmt.Println(result)
+    usage: gogrep [options] PATTERN [PATH...]
+
+	Arguments:
+	  PATTERN  go regular expression
+
+	Options:
+	  -h --help            show this help message and exit
+	  --version            show version and exit
+	  -i --ignore-case     Match case insensitively
+	  --ignore=PATTERNS    exclude files or directories which match these comma
+	                       separated patterns [default: .svn,CVS,.bzr,.hg,.git]
+	  --profile			   Run the go profiler on this run`
+
+	arguments, _ := docopt.Parse(usage, nil, true, "1.0.0rc2", false)
+	if arguments["--profile"].(bool) {
+		f, err := os.Create("gogrep.prof")
+		if err != nil {
+			log.Fatal(err)
 		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
+
+	query = *regexp.MustCompile(arguments["PATTERN"].(string))
+
+	initializeIgnoreList()
+
+	files := make(chan string)
+	go searchPaths(arguments["PATH"].([]string), files)
+	searchFiles(files)
+	fmt.Println("Search finished in: ", time.Since(start))
 }
