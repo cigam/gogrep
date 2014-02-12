@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"sync"
@@ -62,6 +63,7 @@ func colorPrinter(line int, col int, text string) {
 // searchInFile does the actual search for the regex inside the file
 func searchInFile(filename string, printer HitPrinter) {
 	file, err := os.Open(filename)
+	defer file.Close()
 	if err != nil {
 		log.Fatal(os.Stderr, "Failed opening file:", err)
 		return
@@ -93,10 +95,14 @@ func searchInFile(filename string, printer HitPrinter) {
 	}
 }
 
-// searchInDir walks a directory and generated files to search. For every
-// discovered subdirectory, it launches a new go routine (recursively).
+// searchInDir walks a directory and generated files to search.
+//
 func searchInDir(dir string, files chan string) {
-	p, _ := ioutil.ReadDir(dir)
+	p, err := ioutil.ReadDir(dir)
+	if err != nil {
+		log.Fatal(os.Stderr, "Failed opening file:", err)
+		return
+	}
 	for i := 0; i < len(p); i++ {
 		if ignore_files[p[i].Name()] {
 			continue
@@ -114,13 +120,26 @@ func initializeIgnoreList() {
 }
 
 func searchFiles(files chan string) {
-	for i := range files {
-		go searchInFile(i, colorPrinter)
+	// Use a pool of goroutines to search the files, otherwise we might reach
+	// the max open files permitted
+	//
+	var wg sync.WaitGroup
+	const OPEN_FILES = 64
+	for i := 0; i < OPEN_FILES; i++ {
+		wg.Add(1)
+		go func() {
+			for i := range files {
+				searchInFile(i, colorPrinter)
+			}
+			wg.Done()
+		}()
 	}
-
+	// wait for the workers to finish
+	wg.Wait()
 }
 
 func searchPaths(paths []string, files chan string) {
+	// Close the files channel
 	defer close(files)
 	if len(paths) == 0 {
 		pwd, _ := os.Getwd()
@@ -154,7 +173,7 @@ func main() {
 	                       separated patterns [default: .svn,CVS,.bzr,.hg,.git]
 	  --profile			   Run the go profiler on this run`
 
-	arguments, _ := docopt.Parse(usage, nil, true, "1.0.0rc2", false)
+	arguments, _ := docopt.Parse(usage, nil, true, "0.1", false)
 	if arguments["--profile"].(bool) {
 		f, err := os.Create("gogrep.prof")
 		if err != nil {
@@ -164,6 +183,11 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
+	// Since we are mostly IO bound, use also the hyper threads
+	// Should benchmark this though...
+	//
+	runtime.GOMAXPROCS(runtime.NumCPU() * 2)
+
 	query = *regexp.MustCompile(arguments["PATTERN"].(string))
 
 	initializeIgnoreList()
@@ -171,5 +195,6 @@ func main() {
 	files := make(chan string)
 	go searchPaths(arguments["PATH"].([]string), files)
 	searchFiles(files)
+
 	fmt.Println("Search finished in: ", time.Since(start))
 }
